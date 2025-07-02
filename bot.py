@@ -1,5 +1,5 @@
-# Faro Fino News v1.8 - Filtro de Data Corrigido e Status Aprimorado
-# Restaura o filtro de data funcional (tbs=qdr:d7) e mantém o status aprimorado.
+# Faro Fino News v2.1 - Arquitetura Robusta + Cache Buster
+# Adiciona o parâmetro de "ruído" (cache_buster) para garantir resultados sempre novos.
 
 import os
 import json
@@ -11,7 +11,7 @@ import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
-from telegram.error import TelegramError, Conflict
+from telegram.error import TelegramError
 from bs4 import BeautifulSoup
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote
@@ -19,8 +19,10 @@ from urllib.parse import quote
 # --- CONFIGURAÇÕES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CONFIG_PATH = "faro_fino_config_v2.json"
+LOCK_FILE_PATH = "bot.lock"
 MONITORAMENTO_INTERVAL = 300
-DIAS_FILTRO_NOTICIAS = 7 # Mantemos 7 dias para a busca ser ampla
+DIAS_FILTRO_NOTICIAS = 3
+CHUNK_SIZE_KEYWORDS = 5
 TIMEZONE_BR = pytz.timezone('America/Sao_Paulo')
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,39 +32,32 @@ DEFAULT_CONFIG = {"owner_id": None, "keywords": [], "monitoring_on": False, "his
 def load_config():
     if os.path.exists(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                config['history'] = set(config.get('history', []))
-                return config
-        except (json.JSONDecodeError, IOError):
-            return DEFAULT_CONFIG.copy()
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f: config = json.load(f)
+            config['history'] = set(config.get('history', []))
+            return config
+        except (json.JSONDecodeError, IOError): return DEFAULT_CONFIG.copy()
     return DEFAULT_CONFIG.copy()
 
 def save_config(config):
     to_save = config.copy()
     to_save['history'] = list(to_save.get('history', set()))
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        json.dump(to_save, f, indent=4)
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f: json.dump(to_save, f, indent=4)
 
-# --- MOTOR DE BUSCA (COM FILTRO CORRIGIDO) ---
-async def fetch_news(keywords: list) -> list:
+# --- MOTOR DE BUSCA (COM CACHE BUSTER) ---
+async def fetch_news_chunk(keywords_chunk: list) -> list:
     news_items = []
-    if not keywords: return news_items
+    if not keywords_chunk: return news_items
     
-    query_parts = [f'"{k.strip()}"' for k in keywords if k.strip()]
-    query = " OR ".join(query_parts)
-    
+    query = " OR ".join([f'"{k.strip()}"' for k in keywords_chunk])
     encoded_query = quote(query)
     
-    # *** CORREÇÃO CRÍTICA DO FILTRO DE DATA ***
-    # Voltamos a usar o parâmetro 'tbs=qdr:d7' que é o correto para filtrar os últimos 7 dias no RSS.
-    url = f"https://news.google.com/rss/search?q={encoded_query}&hl=pt-BR&gl=BR&ceid=BR:pt-419&tbs=qdr:d{DIAS_FILTRO_NOTICIAS}"
-    # *** FIM DA CORREÇÃO ***
-    
-    logger.info(f"Buscando notícias com URL: {url}")
+    # *** ADIÇÃO DO CACHE BUSTER ("RUÍDO") ***
+    cache_buster = int(datetime.now().timestamp())
+    url = f"https://news.google.com/rss/search?q={encoded_query}&hl=pt-BR&gl=BR&ceid=BR:pt-419&tbs=qdr:d{DIAS_FILTRO_NOTICIAS}&cb={cache_buster}"
+    # *** FIM DA ADIÇÃO ***
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             response = await client.get(url)
             response.raise_for_status()
         soup = BeautifulSoup(response.content, 'lxml-xml')
@@ -72,7 +67,7 @@ async def fetch_news(keywords: list) -> list:
                 news_items.append({'title': item.title.text, 'link': item.link.text, 'source': item.source.text, 'date': pub_date})
             except (AttributeError, TypeError): continue
     except Exception as e:
-        logger.error(f"Erro na busca de notícias: {e}", exc_info=True)
+        logger.error(f"Erro na busca do pedaço {keywords_chunk}: {e}")
     return news_items
 
 async def process_news(context: ContextTypes.DEFAULT_TYPE, is_manual=False, chat_id_manual=None):
@@ -84,17 +79,25 @@ async def process_news(context: ContextTypes.DEFAULT_TYPE, is_manual=False, chat
         return
     if not config.get("monitoring_on") and not is_manual: return
     
-    found_news = await fetch_news(keywords)
-    logger.info(f"Busca no Google retornou {len(found_news)} itens brutos.")
+    keyword_chunks = [keywords[i:i + CHUNK_SIZE_KEYWORDS] for i in range(0, len(keywords), CHUNK_SIZE_KEYWORDS)]
+    all_found_articles = {}
+
+    logger.info(f"Iniciando busca com {len(keywords)} palavras-chave em {len(keyword_chunks)} pedaços.")
+    for i, chunk in enumerate(keyword_chunks):
+        logger.info(f"Buscando pedaço {i+1}/{len(keyword_chunks)}: {chunk}")
+        chunk_results = await fetch_news_chunk(chunk)
+        for article in chunk_results:
+            all_found_articles[article['link']] = article
+        await asyncio.sleep(1)
+
+    found_news = list(all_found_articles.values())
+    logger.info(f"Busca em pedaços retornou {len(found_news)} artigos únicos.")
     
     new_articles, history = [], config.get('history', set())
-    # O filtro de data na URL já é o principal, mas mantemos este como uma segunda camada de segurança.
     limit = datetime.now(TIMEZONE_BR) - timedelta(days=DIAS_FILTRO_NOTICIAS + 1)
-
     for article in found_news:
         if article['link'] in history or (article['date'] and article['date'] < limit): continue
-        text_to_check = f"{article['title']} {article['source']}".lower()
-        if found_kws := [k for k in keywords if k.lower() in text_to_check]:
+        if found_kws := [k for k in keywords if k.lower() in f"{article['title']} {article['source']}".lower()]:
             article['found_keywords'] = list(set(found_kws))
             new_articles.append(article)
             history.add(article['link'])
@@ -105,10 +108,8 @@ async def process_news(context: ContextTypes.DEFAULT_TYPE, is_manual=False, chat
     config['history'] = history
     save_config(config)
     
-    if is_manual and target_chat_id: await context.bot.send_message(chat_id=target_chat_id, text=f"Verificação concluída. {len(new_articles)} novas notícias encontradas.")
-    elif not is_manual: logger.info(f"[Auto] Verificação concluída. {len(new_articles)} novas notícias.")
-
-# --- O RESTANTE DO CÓDIGO (sem alterações) ---
+    if is_manual and target_chat_id:
+        await context.bot.send_message(chat_id=target_chat_id, text=f"Verificação concluída. Encontradas {len(new_articles)} novas notícias.")
 
 async def send_notifications(chat_id, articles, context: ContextTypes.DEFAULT_TYPE):
     for article in sorted(articles, key=lambda x: x['date'], reverse=True):
@@ -128,8 +129,6 @@ async def monitor_loop(app: Application):
             logger.info("Iniciando verificação automática.")
             await process_news(context)
         await asyncio.sleep(MONITORAMENTO_INTERVAL)
-
-def is_owner(update: Update, config: dict): return update.effective_user.id == config.get("owner_id")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_config()
@@ -158,7 +157,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else: msg = "ℹ️ Nenhuma das palavras-chave informadas foi encontrada."
     if changed: config['keywords'] = sorted(list(keywords_set)); save_config(config)
     await update.message.reply_text(msg)
-    
+
 async def limpar_tudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_config()
     if not is_owner(update, config): return
@@ -175,41 +174,21 @@ async def limpar_tudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query or update
-    await query.message.reply_text("Iniciando verificação manual (últimos 7 dias)...")
+    await query.message.reply_text("Iniciando verificação em lotes (com cache buster)...")
     await process_news(context, is_manual=True, chat_id_manual=query.message.chat_id)
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_config()
     if not is_owner(update, config): return
     query = update.callback_query or update
-    await query.message.reply_text("Gerando status e diagnóstico (pode levar um momento)...")
-    status_text = (f"📊 *Status e Diagnóstico*\n\n"
+    await query.message.reply_text("Gerando status...")
+    status_text = (f"📊 *Status v2.1*\n\n"
                    f"∙ Monitoramento: {'🟢 Ativo' if config.get('monitoring_on') else '🔴 Inativo'}\n"
                    f"∙ Palavras-chave: {len(config.get('keywords', []))}\n"
-                   f"∙ Histórico (links salvos): {len(config.get('history', set()))}")
-    keywords = config.get('keywords', [])
-    if keywords:
-        try:
-            found_news = await fetch_news(keywords)
-            total_found = len(found_news)
-            if total_found > 0:
-                relevant_count = sum(1 for article in found_news if any(k.lower() in f"{article['title']} {article['source']}".lower() for k in keywords))
-                relevance_rate = (relevant_count / total_found) * 100 if total_found > 0 else 0
-                status_text += (f"\n\n⚙️ *Performance da Busca (Simulação)*\n"
-                                f"∙ Resultados brutos (Google): `{total_found}`\n"
-                                f"∙ Notícias relevantes (filtradas): `{relevant_count}`\n"
-                                f"∙ Taxa de relevância: `{relevance_rate:.1f}%`")
-            else:
-                status_text += "\n\n⚙️ *Performance da Busca (Simulação)*\n∙ A busca não retornou nenhum resultado."
-        except Exception as e:
-            logger.error(f"Erro na simulação de status: {e}")
-            status_text += "\n\n⚙️ *Performance da Busca (Simulação)*\n∙ Ocorreu um erro ao tentar simular a busca."
-    else:
-        status_text += "\n\n⚙️ *Performance da Busca (Simulação)*\n∙ Adicione palavras-chave para testar a performance."
-    if hasattr(query, 'message') and query.message:
-        await query.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=status_text, parse_mode=ParseMode.MARKDOWN)
+                   f"∙ Histórico: {len(config.get('history', set()))} links\n"
+                   f"∙ Buscas por verificação: {-(len(config.get('keywords', [])) // -CHUNK_SIZE_KEYWORDS)}")
+    if hasattr(query, 'message') and query.message: await query.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
+    else: await context.bot.send_message(chat_id=update.effective_chat.id, text=status_text, parse_mode=ParseMode.MARKDOWN)
 
 async def view_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_config()
@@ -239,17 +218,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_text = '🟢 ATIVADO' if config['monitoring_on'] else '🔴 DESATIVADO'
         await context.bot.send_message(chat_id=query.message.chat_id, text=f"Monitoramento: {status_text}.")
 
-async def post_init_task(app: Application): asyncio.create_task(monitor_loop(app))
+async def post_init_task(app: Application):
+    asyncio.create_task(monitor_loop(app))
 
 def main():
-    if not BOT_TOKEN: logger.error("ERRO: BOT_TOKEN não configurado!"); return
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.post_init = post_init_task
-    handlers = [CommandHandler('limpar_tudo', limpar_tudo), CommandHandler('start', start), CommandHandler('menu', menu_command),
-                CommandHandler('status', status), CommandHandler('verificar', check_now), CommandHandler('verpalavras', view_keywords),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler), CallbackQueryHandler(button_handler)]
-    app.add_handlers(handlers)
-    logger.info("🚀 Faro Fino News v1.8 iniciando!")
-    app.run_polling(drop_pending_updates=True)
+    if os.path.exists(LOCK_FILE_PATH):
+        logger.error(f"Arquivo de trava '{LOCK_FILE_PATH}' encontrado. Outra instância pode estar rodando. Encerrando.")
+        return
+    
+    try:
+        with open(LOCK_FILE_PATH, 'w') as f: f.write(str(os.getpid()))
+        if not BOT_TOKEN: logger.error("ERRO: BOT_TOKEN não configurado!"); return
+        
+        app = Application.builder().token(BOT_TOKEN).build()
+        app.post_init = post_init_task
+        handlers = [CommandHandler('limpar_tudo', limpar_tudo), CommandHandler('start', start), CommandHandler('menu', menu_command),
+                    CommandHandler('status', status), CommandHandler('verificar', check_now), CommandHandler('verpalavras', view_keywords),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler), CallbackQueryHandler(button_handler)]
+        app.add_handlers(handlers)
+        
+        logger.info("🚀 Faro Fino News v2.1 iniciando!")
+        app.run_polling(drop_pending_updates=True)
+
+    finally:
+        if os.path.exists(LOCK_FILE_PATH):
+            os.remove(LOCK_FILE_PATH)
+            logger.info(f"Arquivo de trava '{LOCK_FILE_PATH}' removido. Encerrando.")
 
 if __name__ == "__main__": main()
