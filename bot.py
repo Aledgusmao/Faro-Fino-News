@@ -1,5 +1,5 @@
-# Faro Fino News v2.6 - Integração Correta com API 12ft.io
-# Usa callback e requisição POST para interagir corretamente com o serviço 12ft.io.
+# Faro Fino News v2.6.1 - Correção Crítica de SyntaxError na API 12ft.io
+# Corrige o erro de sintaxe na função get_12ft_link.
 
 import os
 import json
@@ -64,7 +64,6 @@ async def fetch_news_chunk(keywords_chunk: list) -> list:
         logger.error(f"Erro na busca do pedaço {keywords_chunk}: {e}")
     return news_items
 
-# --- PROCESSAMENTO DE NOTÍCIAS (sem alterações) ---
 async def process_news(context: ContextTypes.DEFAULT_TYPE, is_manual=False, chat_id_manual=None):
     config = load_config()
     notification_id = config.get("notification_chat_id")
@@ -100,21 +99,19 @@ async def process_news(context: ContextTypes.DEFAULT_TYPE, is_manual=False, chat
         await context.bot.send_message(chat_id=target_chat_id, text=f"Verificação concluída. Encontradas {len(new_articles)} novas notícias.")
 
 async def send_notifications(chat_id, articles, context: ContextTypes.DEFAULT_TYPE):
-    """Envia as notificações de notícias com botões de ação (Original e callback para 12ft.io)."""
     for article in sorted(articles, key=lambda x: x['date'], reverse=True):
         date_str = article['date'].strftime('%d/%m/%Y %H:%M')
-        message = (f"✅ *{article['title']}*\n\n"
-                   f"🚨 *Encontrado por:* `{', '.join(article['found_keywords'])}`\n"
-                   f"📅 *Publicado em:* {date_str}\n"
-                   f"🌐 *Fonte:* {article['source']}")
+        message = (
+            f"✅ *{article['title']}*\n\n"
+            f"🚨 *Encontrado por:* `{', '.join(article['found_keywords'])}`\n"
+            f"📅 *Publicado em:* {date_str}\n"
+            f"🌐 *Fonte:* {article['source']}"
+        )
         original_link = article['link']
-        # *** ALTERAÇÃO 1: O botão de desbloqueio agora usa callback_data ***
-        keyboard = [
-            [
-                InlineKeyboardButton("🌐 Site Original", url=original_link),
-                InlineKeyboardButton("🔓 Ler Sem Bloqueio", callback_data="unlock_article")
-            ]
-        ]
+        keyboard = [[
+            InlineKeyboardButton("🌐 Site Original", url=original_link),
+            InlineKeyboardButton("🔓 Ler Sem Bloqueio", callback_data="unlock_article")
+        ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         try:
             await context.bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
@@ -134,7 +131,7 @@ async def monitor_loop(app: Application):
 def is_owner(update: Update, config: dict) -> bool:
     return update.effective_user.id == config.get("owner_id")
 
-# --- NOVO HELPER PARA A API 12FT.IO ---
+# *** INÍCIO DA CORREÇÃO ***
 async def get_12ft_link(original_link: str) -> str | None:
     """Faz a requisição POST para a API do 12ft.io para obter o link desbloqueado."""
     api_url = "https://12ft.io/api/proxy"
@@ -142,7 +139,9 @@ async def get_12ft_link(original_link: str) -> str | None:
     payload = {"url": original_link}
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(api_unlocked_link_response = response.json()
+            response = await client.post(api_url, json=payload, headers=headers, timeout=20.0)
+            response.raise_for_status()
+            api_response = response.json()
             if api_response.get("status") == "success" and api_response.get("url"):
                 return api_response["url"]
             else:
@@ -151,10 +150,10 @@ async def get_12ft_link(original_link: str) -> str | None:
     except Exception as e:
         logger.error(f"Erro ao contatar API 12ft.io: {e}")
         return None
+# *** FIM DA CORREÇÃO ***
 
 # --- COMANDOS E HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (código inalterado) ...
     config = load_config()
     if not config.get('owner_id'):
         config['owner_id'] = update.effective_user.id
@@ -164,7 +163,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else: await update.message.reply_text("Bem-vindo de volta!")
 
 async def definir_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (código inalterado) ...
     config = load_config()
     if not is_owner(update, config): return
     chat_id = update.effective_chat.id
@@ -173,7 +171,6 @@ async def definir_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ A partir de agora, as notícias serão enviadas aqui.")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (código inalterado) ...
     config = load_config()
     if not is_owner(update, config): return
     text = update.message.text.strip()
@@ -192,9 +189,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else: msg = "ℹ️ Nenhuma das palavras-chave informadas foi encontrada."
     if changed: config['keywords'] = sorted(list(keywords_set)); save_config(config)
     await update.message.reply_text(msg)
-
+    
 async def limpar_tudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (código inalterado) ...
     config = load_config()
     if not is_owner(update, config): return
     msg = await update.message.reply_text("⚠️ **ATENÇÃO!** Confirmando reset total em 3...")
@@ -208,7 +204,6 @@ async def limpar_tudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e: await msg.edit_text(f"❌ Erro ao apagar: {e}")
 
 async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (código inalterado) ...
     config = load_config()
     if not is_owner(update, config): return
     query = update.callback_query or update
@@ -216,13 +211,12 @@ async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_news(context, is_manual=True, chat_id_manual=query.message.chat_id)
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (código inalterado) ...
     config = load_config()
     if not is_owner(update, config): return
     query = update.callback_query or update
     await query.message.reply_text("Gerando status...")
     dest_chat_id = config.get('notification_chat_id', 'Não definido')
-    status_text = (f"📊 *Status v2.6*\n\n"
+    status_text = (f"📊 *Status v2.6.1*\n\n"
                    f"∙ Monitoramento: {'🟢 Ativo' if config.get('monitoring_on') else '🔴 Inativo'}\n"
                    f"∙ Palavras-chave: {len(config.get('keywords', []))}\n"
                    f"∙ Histórico: {len(config.get('history', set()))} links\n"
@@ -232,7 +226,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else: await context.bot.send_message(chat_id=update.effective_chat.id, text=status_text, parse_mode=ParseMode.MARKDOWN)
 
 async def view_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (código inalterado) ...
     config = load_config()
     if not is_owner(update, config): return
     query = update.callback_query or update
@@ -241,7 +234,6 @@ async def view_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (código inalterado) ...
     config = load_config()
     if not is_owner(update, config): return
     kb = [[InlineKeyboardButton("Verificar Agora", callback_data='check_now')],
@@ -251,37 +243,25 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('⚙️ **Menu Principal**', reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lida com todos os botões, incluindo os do menu e o novo de desbloqueio."""
     query = update.callback_query
     await query.answer()
-
-    # Separa os callbacks do menu dos callbacks de artigo
     if query.data.startswith("unlock_"):
-        if query.data == "unlock_article":
-            # Pega a URL do primeiro botão na mensagem (Site Original)
-            try:
-                original_link = query.message.reply_markup.inline_keyboard[0][0].url
-                await query.edit_message_text(text=f"{query.message.text}\n\n*_🔓 Desbloqueando notícia..._*", parse_mode=ParseMode.MARKDOWN)
-                
-                unlocked_link = await get_12ft_link(original_link)
-                
-                if unlocked_link:
-                    # Sucesso: Edita a mensagem e adiciona um botão para o link desbloqueado
-                    kb = [[InlineKeyboardButton("✅ Notícia Desbloqueada - Clique Aqui", url=unlocked_link)]]
-                    await query.edit_message_text(text=f"{query.message.text}\n\n*_Sucesso!_*", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-                else:
-                    # Falha: Informa o usuário
-                    await query.edit_message_text(text=f"{query.message.text}\n\n*_❌ Falha ao tentar desbloquear o link._*", parse_mode=ParseMode.MARKDOWN)
-            except (AttributeError, IndexError):
-                 await query.edit_message_text(text=f"{query.message.text}\n\n*_❌ Erro: não foi possível encontrar o link original na mensagem._*", parse_mode=ParseMode.MARKDOWN)
-            except BadRequest: # Evita crash se o usuário clicar rápido demais
-                logger.warning("BadRequest: Message is not modified (ignorado).")
-                pass
-
-    else: # Lógica para os botões do menu
+        try:
+            original_link = query.message.reply_markup.inline_keyboard[0][0].url
+            await query.edit_message_text(text=f"{query.message.text}\n\n*_🔓 Desbloqueando notícia..._*", parse_mode=ParseMode.MARKDOWN)
+            unlocked_link = await get_12ft_link(original_link)
+            if unlocked_link:
+                kb = [[InlineKeyboardButton("✅ Notícia Desbloqueada - Clique Aqui", url=unlocked_link)]]
+                await query.edit_message_text(text=f"{query.message.text}\n\n*_Sucesso!_*", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+            else:
+                await query.edit_message_text(text=f"{query.message.text}\n\n*_❌ Falha ao tentar desbloquear o link._*", parse_mode=ParseMode.MARKDOWN)
+        except (AttributeError, IndexError):
+             await query.edit_message_text(text=f"{query.message.text}\n\n*_❌ Erro: não foi possível encontrar o link original._*", parse_mode=ParseMode.MARKDOWN)
+        except BadRequest:
+            logger.warning("BadRequest: Message is not modified (ignorado).")
+    else:
         config = load_config()
         if not is_owner(update, config): return
-        
         if query.data == 'check_now': await check_now(update, context)
         elif query.data == 'status': await status(update, context)
         elif query.data == 'view_keywords': await view_keywords(update, context)
@@ -292,11 +272,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=query.message.chat_id, text=f"Monitoramento: {status_text}.")
 
 async def post_init_task(app: Application):
-    # ... (código inalterado) ...
     asyncio.create_task(monitor_loop(app))
 
 def main():
-    # ... (código inalterado) ...
     if os.path.exists(LOCK_FILE_PATH):
         logger.error(f"Arquivo de trava '{LOCK_FILE_PATH}' encontrado. Encerrando.")
         return
@@ -310,7 +288,7 @@ def main():
                     CommandHandler('definir_grupo', definir_grupo),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler), CallbackQueryHandler(button_handler)]
         app.add_handlers(handlers)
-        logger.info("🚀 Faro Fino News v2.6 iniciando!")
+        logger.info("🚀 Faro Fino News v2.6.1 iniciando!")
         app.run_polling(drop_pending_updates=True)
     finally:
         if os.path.exists(LOCK_FILE_PATH):
