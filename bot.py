@@ -1,5 +1,5 @@
-# Faro Fino News v3.0 - Motor com Resolução de Link e UI Robusta
-# O bot agora resolve os links de redirecionamento do Google para garantir pré-visualizações.
+# Faro Fino News v3.0.1 - Correção do Fluxo de Desbloqueio Assistido
+# Corrige a lógica dos botões na mensagem de ajuda do desbloqueio.
 
 import os
 import json
@@ -44,21 +44,15 @@ def save_config(config):
     to_save['history'] = list(to_save.get('history', set()))
     with open(CONFIG_PATH, 'w', encoding='utf-8') as f: json.dump(to_save, f, indent=4)
 
-# --- INÍCIO DAS ALTERAÇÕES NO MOTOR ---
-
 async def resolve_google_redirect(google_link: str, client: httpx.AsyncClient) -> str:
-    """Segue o redirecionamento de um link do Google News para obter a URL final."""
     try:
-        # Usamos uma requisição HEAD que é mais leve, pois só queremos os cabeçalhos
         response = await client.head(google_link, follow_redirects=True, timeout=10)
         return str(response.url)
     except httpx.RequestError as e:
         logger.warning(f"Não foi possível resolver o redirecionamento para {google_link}: {e}")
-        # Se falhar, retorna o link original do Google como último recurso
         return google_link
 
 async def fetch_news_chunk(keywords_chunk: list, client: httpx.AsyncClient) -> list:
-    """Busca um lote de notícias e já resolve os links de redirecionamento."""
     news_items = []
     if not keywords_chunk: return news_items
     query = " OR ".join([f'"{k.strip()}"' for k in keywords_chunk])
@@ -73,7 +67,6 @@ async def fetch_news_chunk(keywords_chunk: list, client: httpx.AsyncClient) -> l
             try:
                 google_link = item.link.text
                 final_link = await resolve_google_redirect(google_link, client)
-                
                 pub_date = parsedate_to_datetime(item.find('pubDate').text).astimezone(TIMEZONE_BR)
                 news_items.append({'title': item.title.text, 'link': final_link, 'source': item.source.text, 'date': pub_date})
             except (AttributeError, TypeError): continue
@@ -93,13 +86,12 @@ async def process_news(context: ContextTypes.DEFAULT_TYPE, is_manual=False, chat
     
     keyword_chunks = [keywords[i:i + CHUNK_SIZE_KEYWORDS] for i in range(0, len(keywords), CHUNK_SIZE_KEYWORDS)]
     all_found_articles = {}
-
     async with httpx.AsyncClient(follow_redirects=True) as client:
         for i, chunk in enumerate(keyword_chunks):
             chunk_results = await fetch_news_chunk(chunk, client)
             for article in chunk_results: all_found_articles[article['link']] = article
             await asyncio.sleep(1)
-
+    
     found_news = list(all_found_articles.values())
     new_articles, history = [], config.get('history', set())
     limit = datetime.now(TIMEZONE_BR) - timedelta(days=DIAS_FILTRO_NOTICIAS + 1)
@@ -120,69 +112,55 @@ async def process_news(context: ContextTypes.DEFAULT_TYPE, is_manual=False, chat
         await context.bot.send_message(chat_id=target_chat_id, text=f"Verificação concluída. Encontradas {len(new_articles)} novas notícias.")
 
 async def send_notifications(chat_id, articles, context: ContextTypes.DEFAULT_TYPE):
-    """Envia notificações com o título no texto e usa o link final para o preview."""
     global color_index
     for article in sorted(articles, key=lambda x: x['date'], reverse=True):
         date_str = article['date'].strftime('%d/%m/%Y %H:%M')
         color_emoji = COLOR_EMOJIS[color_index]
         color_index = (color_index + 1) % len(COLOR_EMOJIS)
         
-        # O título voltou para o texto, garantindo que a informação nunca seja perdida.
-        message = (
-            f"{color_emoji} *{article['title']}*\n\n"
-            f"🚨 *Encontrado por:* `{', '.join(article['found_keywords'])}`\n"
-            f"📅 *Publicado em:* {date_str}\n"
-            f"🌐 *Fonte:* {article['source']}"
-        )
+        message = (f"{color_emoji} *{article['title']}*\n\n"
+                   f"🚨 *Encontrado por:* `{', '.join(article['found_keywords'])}`\n"
+                   f"📅 *Publicado em:* {date_str}\n"
+                   f"🌐 *Fonte:* {article['source']}")
         
         final_link = article['link']
-        
         keyboard = [[
             InlineKeyboardButton("🌐 Site Original", url=final_link),
             InlineKeyboardButton("🔓 Desbloquear Notícia", callback_data="unlock_article")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-
         try:
             await context.bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup,
-                disable_web_page_preview=False # Habilitado para gerar a imagem
+                chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN, 
+                reply_markup=reply_markup, disable_web_page_preview=False
             )
             await asyncio.sleep(2)
         except TelegramError as e:
             logger.error(f"Falha ao enviar notificação para {final_link}: {e}")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lida com botões, pegando o link final do botão 'Site Original'."""
     query = update.callback_query
     if not query: return
     
     if query.data == "unlock_article":
         await query.answer()
         try:
-            # A fonte da verdade para o link é o botão "Site Original"
             original_link = query.message.reply_markup.inline_keyboard[0][0].url
             help_message = (
                 "**Para ler a notícia bloqueada:**\n\n"
-                "1. **Clique no link abaixo para copiar:**"
+                "1. Primeiro, clique no botão abaixo para abrir o serviço de desbloqueio em uma nova aba.\n\n"
+                "2. Depois, volte aqui e clique no link que enviarei a seguir para copiá-lo."
             )
-            unlock_keyboard = [[InlineKeyboardButton("2. Agora, clique aqui para abrir o serviço", url="https://www.removepaywall.com/")]]
+            unlock_keyboard = [[InlineKeyboardButton("Abrir Serviço de Desbloqueio", url="https://www.removepaywall.com/")]]
             
             await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=help_message,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_to_message_id=query.message.message_id,
-                disable_web_page_preview=True
+                chat_id=query.message.chat_id, text=help_message,
+                parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(unlock_keyboard),
+                reply_to_message_id=query.message.message_id
             )
             await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=f"`{original_link}`",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup(unlock_keyboard)
+                chat_id=query.message.chat_id, text=f"`{original_link}`",
+                parse_mode=ParseMode.MARKDOWN
             )
         except (AttributeError, IndexError):
              await query.answer("❌ Erro: não foi possível encontrar o link original.", show_alert=True)
@@ -203,7 +181,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_text = '🟢 ATIVADO' if config['monitoring_on'] else '🔴 DESATIVADO'
         await context.bot.send_message(chat_id=query.message.chat_id, text=f"Monitoramento: {status_text}.")
         
-# --- RESTANTE DO CÓDIGO (INTOCÁVEL E JÁ ESTÁVEL) ---
 async def monitor_loop(app: Application):
     context = ContextTypes.DEFAULT_TYPE(application=app)
     await asyncio.sleep(15)
@@ -285,7 +262,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query or update
     await query.message.reply_text("Gerando status...")
     dest_chat_id = config.get('notification_chat_id', 'Não definido')
-    status_text = (f"📊 *Status v3.0*\n\n"
+    status_text = (f"📊 *Status v3.0.1*\n\n"
                    f"∙ Monitoramento: {'🟢 Ativo' if config.get('monitoring_on') else '🔴 Inativo'}\n"
                    f"∙ Palavras-chave: {len(config.get('keywords', []))}\n"
                    f"∙ Histórico: {len(config.get('history', set()))} links\n"
@@ -327,7 +304,7 @@ def main():
                     CommandHandler('limpar_tudo', limpar_tudo),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler), CallbackQueryHandler(button_handler)]
         app.add_handlers(handlers)
-        logger.info("🚀 Faro Fino News v3.0 iniciando!")
+        logger.info("🚀 Faro Fino News v3.0.1 iniciando!")
         app.run_polling(drop_pending_updates=True)
     finally:
         if os.path.exists(LOCK_FILE_PATH):
