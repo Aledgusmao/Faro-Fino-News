@@ -1,5 +1,5 @@
-# Faro Fino News v3.0.1 - Correção do Fluxo de Desbloqueio Assistido
-# Corrige a lógica dos botões na mensagem de ajuda do desbloqueio.
+# Faro Fino News v3.1 - Fluxo de Desbloqueio Intuitivo
+# Simplifica a ajuda de desbloqueio para uma única mensagem com um botão de ação claro.
 
 import os
 import json
@@ -16,7 +16,8 @@ from bs4 import BeautifulSoup
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
-# --- CONFIGURAÇÕES e CÓDIGO BASE (INTOCÁVEL) ---
+# --- [Todo o código anterior (CONFIG, MOTOR, etc.) permanece idêntico] ---
+# ... (código da v3.0.1 até a função button_handler) ...
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CONFIG_PATH = "faro_fino_config_v2.json"
 LOCK_FILE_PATH = "bot.lock"
@@ -138,34 +139,50 @@ async def send_notifications(chat_id, articles, context: ContextTypes.DEFAULT_TY
         except TelegramError as e:
             logger.error(f"Falha ao enviar notificação para {final_link}: {e}")
 
+# --- INÍCIO DA ALTERAÇÃO FINAL ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lida com botões, incluindo o fluxo de desbloqueio simplificado."""
     query = update.callback_query
     if not query: return
     
     if query.data == "unlock_article":
-        await query.answer()
+        await query.answer() # Confirma o clique para o Telegram
         try:
+            # Pega o link do primeiro botão (Site Original) da mensagem original
             original_link = query.message.reply_markup.inline_keyboard[0][0].url
-            help_message = (
-                "**Para ler a notícia bloqueada:**\n\n"
-                "1. Primeiro, clique no botão abaixo para abrir o serviço de desbloqueio em uma nova aba.\n\n"
-                "2. Depois, volte aqui e clique no link que enviarei a seguir para copiá-lo."
-            )
-            unlock_keyboard = [[InlineKeyboardButton("Abrir Serviço de Desbloqueio", url="https://www.removepaywall.com/")]]
             
+            # Monta a mensagem de ajuda com o link copiável e o botão de ação
+            help_text = (
+                "Para desbloquear, clique para copiar o link abaixo e cole no site que será aberto:"
+            )
+            
+            # O link para copiar
+            link_to_copy = f"`{original_link}`"
+
+            # O botão que abre o serviço
+            unlock_button = InlineKeyboardButton("Abrir Serviço de Desbloqueio", url="https://www.removepaywall.com/")
+            keyboard = [[unlock_button]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Envia a mensagem de ajuda primeiro
             await context.bot.send_message(
-                chat_id=query.message.chat_id, text=help_message,
-                parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(unlock_keyboard),
+                chat_id=query.message.chat_id,
+                text=help_text,
                 reply_to_message_id=query.message.message_id
             )
+            # Envia o link copiável com o botão
             await context.bot.send_message(
-                chat_id=query.message.chat_id, text=f"`{original_link}`",
-                parse_mode=ParseMode.MARKDOWN
+                chat_id=query.message.chat_id,
+                text=link_to_copy,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
             )
+
         except (AttributeError, IndexError):
              await query.answer("❌ Erro: não foi possível encontrar o link original.", show_alert=True)
         return
 
+    # Lógica para os botões do menu (só para o dono)
     config = load_config()
     if not is_owner(update, config):
         await query.answer("Você não tem permissão para usar este botão.", show_alert=True)
@@ -180,6 +197,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_config(config)
         status_text = '🟢 ATIVADO' if config['monitoring_on'] else '🔴 DESATIVADO'
         await context.bot.send_message(chat_id=query.message.chat_id, text=f"Monitoramento: {status_text}.")
+# --- FIM DA ALTERAÇÃO FINAL ---
         
 async def monitor_loop(app: Application):
     context = ContextTypes.DEFAULT_TYPE(application=app)
@@ -262,7 +280,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query or update
     await query.message.reply_text("Gerando status...")
     dest_chat_id = config.get('notification_chat_id', 'Não definido')
-    status_text = (f"📊 *Status v3.0.1*\n\n"
+    status_text = (f"📊 *Status v3.1*\n\n"
                    f"∙ Monitoramento: {'🟢 Ativo' if config.get('monitoring_on') else '🔴 Inativo'}\n"
                    f"∙ Palavras-chave: {len(config.get('keywords', []))}\n"
                    f"∙ Histórico: {len(config.get('history', set()))} links\n"
@@ -304,7 +322,7 @@ def main():
                     CommandHandler('limpar_tudo', limpar_tudo),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler), CallbackQueryHandler(button_handler)]
         app.add_handlers(handlers)
-        logger.info("🚀 Faro Fino News v3.0.1 iniciando!")
+        logger.info("🚀 Faro Fino News v3.1 iniciando!")
         app.run_polling(drop_pending_updates=True)
     finally:
         if os.path.exists(LOCK_FILE_PATH):
