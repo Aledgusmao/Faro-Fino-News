@@ -1,5 +1,5 @@
-# Faro Fino News v2.8.1 - Correção Cirúrgica e Transparente do Desbloqueio
-# Baseado na versão estável v2.2, com a adição PONTUAL e VERIFICADA da funcionalidade de desbloqueio.
+# Faro Fino News v2.9 - Pré-visualização com Imagem e Desbloqueio Assistido
+# Implementa notificações com imagens (sem repetir título) e o fluxo de desbloqueio aprimorado.
 
 import os
 import json
@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
-# --- CONFIGURAÇÕES E CÓDIGO BASE (INTOCÁVEL DA v2.2) ---
+# --- CONFIGURAÇÕES e CÓDIGO BASE (INTOCÁVEL) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CONFIG_PATH = "faro_fino_config_v2.json"
 LOCK_FILE_PATH = "bot.lock"
@@ -26,7 +26,7 @@ CHUNK_SIZE_KEYWORDS = 5
 TIMEZONE_BR = pytz.timezone('America/Sao_Paulo')
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
-DEFAULT_CONFIG = {"owner_id": None, "keywords": [], "monitoring_on": False, "history": set()}
+DEFAULT_CONFIG = {"owner_id": None, "notification_chat_id": None, "keywords": [], "monitoring_on": False, "history": set()}
 
 def load_config():
     if os.path.exists(CONFIG_PATH):
@@ -65,22 +65,20 @@ async def fetch_news_chunk(keywords_chunk: list) -> list:
 
 async def process_news(context: ContextTypes.DEFAULT_TYPE, is_manual=False, chat_id_manual=None):
     config = load_config()
+    notification_id = config.get("notification_chat_id")
     owner_id, keywords = config.get("owner_id"), config.get("keywords")
-    # Na v2.2, o destino é sempre o owner. Manteremos isso por enquanto.
-    target_chat_id = chat_id_manual if is_manual else owner_id
+    target_chat_id = chat_id_manual if is_manual else notification_id
     if not owner_id or not keywords:
         if is_manual and target_chat_id: await context.bot.send_message(chat_id=target_chat_id, text="Nenhuma palavra-chave configurada.")
         return
     if not config.get("monitoring_on") and not is_manual: return
     keyword_chunks = [keywords[i:i + CHUNK_SIZE_KEYWORDS] for i in range(0, len(keywords), CHUNK_SIZE_KEYWORDS)]
     all_found_articles = {}
-    logger.info(f"Iniciando busca com {len(keywords)} palavras-chave em {len(keyword_chunks)} pedaços.")
     for i, chunk in enumerate(keyword_chunks):
         chunk_results = await fetch_news_chunk(chunk)
         for article in chunk_results: all_found_articles[article['link']] = article
         await asyncio.sleep(1)
     found_news = list(all_found_articles.values())
-    logger.info(f"Busca em pedaços retornou {len(found_news)} artigos únicos.")
     new_articles, history = [], config.get('history', set())
     limit = datetime.now(TIMEZONE_BR) - timedelta(days=DIAS_FILTRO_NOTICIAS + 1)
     for article in found_news:
@@ -89,94 +87,85 @@ async def process_news(context: ContextTypes.DEFAULT_TYPE, is_manual=False, chat
             article['found_keywords'] = list(set(found_kws))
             new_articles.append(article)
             history.add(article['link'])
-    logger.info(f"Após filtros, {len(new_articles)} são novas.")
-    # Na v2.2, o destino é sempre o owner.
-    if new_articles: await send_notifications(owner_id, new_articles, context)
+    if new_articles and notification_id:
+        await send_notifications(notification_id, new_articles, context)
     config['history'] = history
     save_config(config)
     if is_manual and target_chat_id:
         await context.bot.send_message(chat_id=target_chat_id, text=f"Verificação concluída. Encontradas {len(new_articles)} novas notícias.")
 
-async def monitor_loop(app: Application):
-    context = ContextTypes.DEFAULT_TYPE(application=app)
-    await asyncio.sleep(15)
-    while True:
-        config = load_config()
-        if config.get("monitoring_on") and config.get("owner_id"):
-            await process_news(context)
-        await asyncio.sleep(MONITORAMENTO_INTERVAL)
-
-def is_owner(update: Update, config: dict) -> bool:
-    return update.effective_user.id == config.get("owner_id")
-
-# --- INÍCIO DAS NOVAS FUNÇÕES ---
-
-async def get_12ft_link(original_link: str) -> str | None:
-    """Faz a requisição POST para a API do 12ft.io com headers de navegador."""
-    api_url = "https://12ft.io/api/v1/proxy"
-    headers = {
-        "Referer": "https://12ft.io/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0"
-    }
-    payload = {"url": original_link}
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(api_url, json=payload, headers=headers, timeout=20.0)
-            response.raise_for_status()
-            api_response = response.json()
-            if api_response.get("status") == "success" and api_response.get("url"):
-                return api_response["url"]
-    except Exception as e:
-        logger.error(f"Erro ao contatar API 12ft.io: {e}")
-    return None
+# --- INÍCIO DAS ALTERAÇÕES (send_notifications e button_handler) ---
 
 async def send_notifications(chat_id, articles, context: ContextTypes.DEFAULT_TYPE):
-    """Envia notificações com botões de ação para desbloqueio."""
+    """Envia notificações com pré-visualização (imagem) e botões de ação."""
     for article in sorted(articles, key=lambda x: x['date'], reverse=True):
         date_str = article['date'].strftime('%d/%m/%Y %H:%M')
+        
+        # O link da notícia é a primeira coisa na mensagem para o Telegram gerar o preview a partir dele.
+        # O resto do texto vem depois, sem repetir o título.
         message = (
-            f"✅ *{article['title']}*\n\n"
+            f"{article['link']}\n\n"
             f"🚨 *Encontrado por:* `{', '.join(article['found_keywords'])}`\n"
             f"📅 *Publicado em:* {date_str}\n"
             f"🌐 *Fonte:* {article['source']}"
         )
-        original_link = article['link']
+        
         keyboard = [[
-            InlineKeyboardButton("🌐 Site Original", url=original_link),
-            InlineKeyboardButton("🔓 Ler Sem Bloqueio", callback_data="unlock_article")
+            # O botão do site original agora é redundante, mas podemos manter se quiser
+            # ou remover para uma interface mais limpa. Vamos remover por enquanto.
+            InlineKeyboardButton("🔓 Desbloquear Notícia", callback_data="unlock_article")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
+
         try:
-            await context.bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-            await asyncio.sleep(1.5)
+            await context.bot.send_message(
+                chat_id=chat_id, 
+                text=message, 
+                parse_mode=ParseMode.MARKDOWN, 
+                reply_markup=reply_markup,
+                disable_web_page_preview=False # ESSENCIAL: Habilita a caixinha com a imagem
+            )
+            await asyncio.sleep(2) # Aumenta um pouco a pausa para o Telegram processar o preview
         except TelegramError as e:
-            logger.error(f"Falha ao enviar notificação para {original_link}: {e}")
+            logger.error(f"Falha ao enviar notificação para {article['link']}: {e}")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lida com botões do menu e com o novo botão de desbloqueio."""
+    """Lida com botões do menu e com o desbloqueio assistido."""
     query = update.callback_query
     if not query: return
-
-    # Lógica para o botão de desbloqueio
+    
+    # Lógica para o desbloqueio assistido
     if query.data == "unlock_article":
-        await query.answer("🔓 Tentando desbloquear...") # Notificação pop-up
+        await query.answer()
         try:
-            original_link = query.message.reply_markup.inline_keyboard[0][0].url
-            unlocked_link = await get_12ft_link(original_link)
+            # O link agora está no texto da mensagem, não mais em um botão
+            original_link = query.message.text.split('\n')[0]
             
-            if unlocked_link:
-                # Envia uma nova mensagem respondendo à original
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=f"✅ Link desbloqueado com sucesso:\n{unlocked_link}",
-                    reply_to_message_id=query.message.message_id,
-                    disable_web_page_preview=True
-                )
-            else:
-                # Mostra um pop-up de alerta em caso de falha
-                await query.answer("❌ Falha ao tentar desbloquear o link.", show_alert=True)
+            help_message = (
+                "**Para ler a notícia bloqueada:**\n\n"
+                "1. **Clique no link abaixo para copiar:**"
+            )
+            
+            # Botão que abre o site de desbloqueio
+            unlock_keyboard = [[InlineKeyboardButton("2. Agora, clique aqui para abrir o serviço", url="https://www.removepaywall.com/")]]
+            
+            # Envia a mensagem de ajuda com o botão
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=help_message,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_to_message_id=query.message.message_id,
+                disable_web_page_preview=True
+            )
+            # Envia o link como uma mensagem separada para facilitar a cópia
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"`{original_link}`",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(unlock_keyboard) # Adiciona o botão aqui
+            )
         except (AttributeError, IndexError):
-             await query.answer("❌ Erro: não foi possível encontrar o link original.", show_alert=True)
+             await query.answer("❌ Erro: não foi possível encontrar o link original na mensagem.", show_alert=True)
         return
 
     # Lógica para os botões do menu (só para o dono)
@@ -190,21 +179,48 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == 'check_now': await check_now(update, context)
     elif query.data == 'status': await status(update, context)
     elif query.data == 'view_keywords': await view_keywords(update, context)
+    elif query.data == 'reset_config': await limpar_tudo(update, context)
     elif query.data == 'toggle_monitoring':
         config['monitoring_on'] = not config.get('monitoring_on', False)
         save_config(config)
         status_text = '🟢 ATIVADO' if config['monitoring_on'] else '🔴 DESATIVADO'
         await context.bot.send_message(chat_id=query.message.chat_id, text=f"Monitoramento: {status_text}.")
 
-# --- RESTANTE DO CÓDIGO (INTOCÁVEL DA v2.2) ---
+# --- RESTANTE DO CÓDIGO (INTOCÁVEL E JÁ ESTÁVEL) ---
+async def monitor_loop(app: Application):
+    context = ContextTypes.DEFAULT_TYPE(application=app)
+    await asyncio.sleep(15)
+    while True:
+        config = load_config()
+        if config.get("monitoring_on") and config.get("owner_id"):
+            await process_news(context)
+        await asyncio.sleep(MONITORAMENTO_INTERVAL)
+
+def is_owner(update: Update, config: dict) -> bool:
+    return update.effective_user.id == config.get("owner_id")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_config()
+    user_name = update.effective_user.first_name
     if not config.get('owner_id'):
         config['owner_id'] = update.effective_user.id
+        config['notification_chat_id'] = update.effective_chat.id
         save_config(config)
-        await update.message.reply_text("Bem-vindo! Use /menu. Em caso de problemas, use /limpar_tudo.")
-    else: await update.message.reply_text("Bem-vindo de volta!")
+        welcome_text = (f"Olá, {user_name}! 👋\n\n"
+                        "Eu sou o *Faro Fino News*, seu farejador de notícias particular.\n\n"
+                        "Seu ID foi registrado. Use /menu para começar.\n"
+                        "Para receber notícias em um grupo, me adicione lá e use /definir_grupo.")
+        await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(f"Bem-vindo de volta, {user_name}!")
+
+async def definir_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    config = load_config()
+    if not is_owner(update, config): return
+    chat_id = update.effective_chat.id
+    config['notification_chat_id'] = chat_id
+    save_config(config)
+    await update.message.reply_text("✅ A partir de agora, as notícias serão enviadas aqui.")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_config()
@@ -236,9 +252,8 @@ async def limpar_tudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(CONFIG_PATH):
             os.remove(CONFIG_PATH)
             await msg.edit_text("✅ **Configuração e histórico apagados!**\n\nUse /start para recomeçar.")
-            logger.info(f"Config removida pelo dono.")
         else: await msg.edit_text("ℹ️ Nenhuma configuração encontrada para apagar.")
-    except Exception as e: await msg.edit_text(f"❌ Erro ao apagar: {e}"); logger.error(f"Falha ao apagar config: {e}")
+    except Exception as e: await msg.edit_text(f"❌ Erro ao apagar: {e}")
 
 async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_config()
@@ -252,10 +267,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update, config): return
     query = update.callback_query or update
     await query.message.reply_text("Gerando status...")
-    status_text = (f"📊 *Status v2.8.1*\n\n" # Versão atualizada
+    dest_chat_id = config.get('notification_chat_id', 'Não definido')
+    status_text = (f"📊 *Status v2.9*\n\n"
                    f"∙ Monitoramento: {'🟢 Ativo' if config.get('monitoring_on') else '🔴 Inativo'}\n"
                    f"∙ Palavras-chave: {len(config.get('keywords', []))}\n"
                    f"∙ Histórico: {len(config.get('history', set()))} links\n"
+                   f"∙ Destino Notificações: `{dest_chat_id}`\n"
                    f"∙ Buscas por verificação: {-(len(config.get('keywords', [])) // -CHUNK_SIZE_KEYWORDS)}")
     if hasattr(query, 'message') and query.message: await query.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
     else: await context.bot.send_message(chat_id=update.effective_chat.id, text=status_text, parse_mode=ParseMode.MARKDOWN)
@@ -273,7 +290,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update, config): return
     kb = [[InlineKeyboardButton("Verificar Agora", callback_data='check_now')],
           [InlineKeyboardButton("Ligar/Desligar Monitoramento", callback_data='toggle_monitoring')],
-          [InlineKeyboardButton("Ver Status e Diagnóstico", callback_data='status')],
+          [InlineKeyboardButton("Resetar Configuração", callback_data='reset_config')],
           [InlineKeyboardButton("Listar Palavras-Chave", callback_data='view_keywords')]]
     await update.message.reply_text('⚙️ **Menu Principal**', reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
@@ -288,12 +305,13 @@ def main():
         if not BOT_TOKEN: logger.error("ERRO: BOT_TOKEN não configurado!"); return
         app = Application.builder().token(BOT_TOKEN).build()
         app.post_init = post_init_task
-        # O handler de botão já está registrado e agora tem a nova lógica
-        handlers = [CommandHandler('limpar_tudo', limpar_tudo), CommandHandler('start', start), CommandHandler('menu', menu_command),
-                    CommandHandler('status', status), CommandHandler('verificar', check_now), CommandHandler('verpalavras', view_keywords),
+        handlers = [CommandHandler('start', start), CommandHandler('menu', menu_command),
+                    CommandHandler('status', status), CommandHandler('verificar', check_now), 
+                    CommandHandler('verpalavras', view_keywords), CommandHandler('definir_grupo', definir_grupo),
+                    CommandHandler('limpar_tudo', limpar_tudo),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler), CallbackQueryHandler(button_handler)]
         app.add_handlers(handlers)
-        logger.info("🚀 Faro Fino News v2.8.1 iniciando!")
+        logger.info("🚀 Faro Fino News v2.9 iniciando!")
         app.run_polling(drop_pending_updates=True)
     finally:
         if os.path.exists(LOCK_FILE_PATH):
